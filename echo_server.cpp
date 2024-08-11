@@ -7,6 +7,7 @@
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #include <winsock2.h>
+#include <winnls.h>
 
 #include <memory>
 #include <iostream>
@@ -37,6 +38,7 @@ namespace server_types {
 template <typename... Args>
 struct std::coroutine_traits<void, Args...> {
     struct promise_type {
+
         void get_return_object() noexcept {}
         std::suspend_never initial_suspend() noexcept { return {}; }
         std::suspend_never final_suspend() noexcept { return {}; }
@@ -45,22 +47,30 @@ struct std::coroutine_traits<void, Args...> {
     };
 };
 
-struct awaiter_read {
-    awaiter_read(async_io::socket& _socket, char* _buffer, size_t _length) : 
+template<bool _IsRead>
+struct awaitable {
+    awaitable(async_io::socket& _socket, char* _buffer, size_t _length) : 
         m_socket(_socket), 
         m_buffer(_buffer), 
         m_length_buffer(_length) {}
 
     bool await_ready() { return false; }
+
     std::pair<boost::system::error_code, size_t> await_resume() { return std::make_pair(m_ec, m_size); }
     void await_suspend(std::coroutine_handle<> coro) {
-        m_socket.async_read_some(async_io::buffer(m_buffer, m_length_buffer), 
-                            [this, coro](std::error_code ec, size_t size) {
-                                
-                                m_ec = ec;
-                                m_size = size;
-                                coro.resume();
-                            });
+        auto callback = [this, coro](std::error_code ec, size_t size) {            
+                            m_ec = ec;
+                            m_size = size;
+                            coro.resume();
+                        };
+
+        if constexpr (_IsRead) {
+            m_socket.async_read_some(async_io::buffer(m_buffer, m_length_buffer), 
+                                callback);
+        } else {
+            m_socket.async_write_some(async_io::buffer(m_buffer, m_length_buffer), 
+                            callback);
+        }
     }
 
 
@@ -73,34 +83,38 @@ private:
     size_t m_size;
 };
 
+using awaiter_read = awaitable<true>;
+using awaiter_write = awaitable<false>;
 
-struct awaiter_write {
-    awaiter_write(async_io::socket& _socket, char* _buffer, size_t _length) : 
-        m_socket(_socket), 
-        m_buffer(_buffer), 
-        m_length_buffer(_length) {}
+struct awaiter_accept {
 
-    bool await_ready() { return false; }
-    auto await_resume() { return std::make_pair(m_ec, m_size); }
-    void await_suspend(std::coroutine_handle<> coro) {
-        m_socket.async_write_some(async_io::buffer(m_buffer, m_length_buffer), 
-                            [this, coro](std::error_code ec, size_t size){
-                                m_ec = ec;
-                                m_size = size;
-                                coro.resume();
-                            });
+    awaiter_accept(async_io::acceptor& _acceptor, async_io::socket& _client_sock) :
+        m_acceptor(_acceptor),
+        m_client_sock(_client_sock) {}
+
+    bool await_ready() noexcept {
+        return false;
     }
 
+    boost::system::error_code await_resume() {
+        return m_er_code;
+    }
+
+    void await_suspend(std::coroutine_handle<> _handle) {
+        auto callback = [this, _handle](boost::system::error_code _error) {
+            m_er_code = _error;
+            _handle.resume();
+        };
+        m_acceptor.async_accept(m_client_sock, callback);
+    }
 
 private:
-    async_io::socket& m_socket;
-    char* m_buffer;
-    size_t m_length_buffer;
+    async_io::socket& m_client_sock;
+    async_io::acceptor& m_acceptor;
 
-    boost::system::error_code m_ec;
-    size_t m_size;
-};
-
+    boost::system::error_code m_er_code;
+    
+};  
 
 
 void print_message(const char* _buff, size_t _length) {
@@ -136,6 +150,7 @@ public:
 
             if (err_code_write) {
                 std::cout << err_code_write.message() << " " << ec.value() << std::endl;
+                break;
             }
         }
     }
@@ -170,21 +185,28 @@ public:
         std::cout << "server protocol family = " << m_acceptor.local_endpoint().protocol().family() << std::endl;
         do_accept();
     }
+
 private:
+    static awaiter_accept async_accept(async_io::acceptor& m_acceptor, async_io::socket& m_client_socket) {
+        return awaiter_accept{m_acceptor, m_client_socket};
+    }
+
     void do_accept() {
-
+        
         std::cout << "wait client..." << std::endl;
+        
 
-        m_acceptor.async_accept(m_client_socket, [this](std::error_code _error) {
-                                                    
-                                                    if (!_error) {
-                                                        std::cout << "new connection!!!" << std::endl;
-                                                        std::make_shared<session>(std::move(m_client_socket))->start();
-                                                    } else {
-                                                        std::cout << "error: " << _error.message() << std::endl;
-                                                    }
-                                                    do_accept();
-                                                });
+        for(;;) {
+            
+            boost::system::error_code ec = co_await async_accept(m_acceptor, m_client_socket);
+            if (ec) {
+                std::cout << ec.message();
+            } else {
+                std::cout << "new client!" << std::endl;
+                // запуск сесси обработки клиентов 
+                std::make_shared<session>(std::move(m_client_socket))->start();
+            }
+        }
 
     }
 
@@ -197,6 +219,8 @@ private:
 };
 
 int main() {
+    SetThreadUILanguage(MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US));
+
     auto context = std::make_shared<async_io::io_context>();
     try {
         echo_server serv(context, server_consts::PORT);
